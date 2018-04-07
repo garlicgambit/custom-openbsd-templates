@@ -1,0 +1,395 @@
+#!/bin/ksh
+
+# Variables
+internal_ip="172.16.1.1" # The internal IP of the system
+internal_network="172.16.1.0"
+internal_netmask="24" # 24 = 255.255.255.0
+dns_server="192.168.1.1" # Optional DNS server
+tor_server="192.168.1.1" # Optional Tor server
+tor_controlport="9052"
+tor_socksport_default="9050"
+tor_socksport_mua="9061"
+tor_socksport_tails="9062"
+tor_socksport_browser="9150"
+tor_socksport_onion="9250"
+tor_socksport_onion_auth="9350"
+## TODO: Kovri/I2P
+#i2p_socksport_default=""
+#i2p_socksport_monero=""
+#i2p_socksport_browser=""
+#i2p_server="192.168.1.1" # Optional I2P server
+
+echo ""
+echo "### CUSTOM INSTALL SCRIPT ###"
+echo ""
+
+# Push custom cryptographic seed 1 into the kernel
+if [[ -f /custom-random.seed1 ]]; then
+  dd if=/custom-random.seed1 of=/dev/random bs=65536 count=1 status=none
+  rm -P /custom-random.seed1
+fi
+
+# Configure securelevel 2 on boot
+echo "# Configure securelevel 2 on system boot" >> /etc/rc.local
+echo "sysctl kern.securelevel=2" >> /etc/rc.local
+
+# Disable library reordering on boot
+echo "library_aslr=NO" >> /etc/rc.conf.local
+
+# Disable sshd on boot
+echo "sshd_flags=NO" >> /etc/rc.conf.local
+
+# Disable ntpd on boot
+echo "ntpd_flags=NO" >> /etc/rc.conf.local
+
+# Enable ipv4 routing
+echo "# Enable ipv4 routing" >> /etc/sysctl.conf
+echo "net.inet.ip.forwarding=1" >> /etc/sysctl.conf
+
+## Disable ddb.panic to prevent securelevel changes
+echo "# Disable ddb.panic to prevent securelevel changes" >> /etc/sysctl.conf
+echo "ddb.panic=0" >> /etc/sysctl.conf
+
+
+#################################
+### PF FIREWALL CONFIGURATION ###
+#################################
+
+## Backup pf firewall configuration
+cp /etc/pf.conf /etc/pf.conf-orig
+
+## Configure pf firewall
+cat <<__EOF> /etc/pf.conf
+
+############
+## TABLES ##
+############
+
+# RFC1918
+table <private> const { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }
+
+# Other non-routable ip addresses
+table <nonroutable> const { 0.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32 }
+
+#############
+## OPTIONS ##
+#############
+
+## Drop blocked packets
+set block-policy drop
+
+## Allow traffic loopback interface
+set skip on lo
+
+###################
+## GENERAL RULES ##
+###################
+
+## Default deny policy
+block
+
+## Block ipv6 traffic
+block quick inet6
+
+###################
+## ANTI SPOOFING ##
+###################
+
+## Antispoofing for external interface
+antispoof quick for egress
+
+## Block packets with wrong source interface
+block in quick from urpf-failed
+
+## Block packets with no route
+block in quick from no-route
+
+###########################
+## TRAFFIC NORMALIZATION ##
+###########################
+
+## Scrub all incoming packets
+match in all scrub (no-df max-mss 1440)
+
+## Scrub outbound packets
+match out on egress all scrub (no-df random-id reassemble tcp max-mss 1440)
+
+###############
+## NAT RULES ##
+###############
+
+## Nat all traffic from ${internal_network}
+match out on egress from ${internal_network}/${internal_netmask} nat-to (egress)
+
+###################
+## INBOUND RULES ##
+###################
+
+## Allow inbound SSH traffic from ${internal_network} to ${internal_ip}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${internal_ip} port 22 user root
+
+## Block all inbound traffic from ${internal_network} destined to this system
+block in quick on ! egress inet from ${internal_network}/${internal_netmask} to self
+
+## Allow all inbound traffic from ${internal_network}
+pass in quick on ! egress inet from ${internal_network}/${internal_netmask} to any
+
+####################
+## OUTBOUND RULES ##
+####################
+
+## Allow outbound traffic from this system to DHCP
+#pass out quick on egress proto udp from (egress) port 68 to egress:network port 67
+
+## Block all outbound traffic to RFC1918 local area network addresses
+block out quick on egress inet from any to <private>
+
+## Block all outbound traffic to other non-routable addresses
+block out quick on egress inet from any to <nonroutable>
+
+## Allow outbound traffic from this system to NTP
+## Put the first line before 'Block all outbound traffic to RFC1918 local
+## area network addresses' if you use a local DNS resolver
+#pass out quick on egress inet proto udp from (egress) to ${dns_server} port 53 user _ntp
+#pass out quick on egress inet proto udp from (egress) to any port 123 user _ntp
+#pass out quick on egress inet proto tcp from (egress) to any port 443 user _ntp
+
+## Allow outbound traffic from this system to fetch non-free firmware
+## Put the first line before 'Block all outbound traffic to RFC1918 local
+## area network addresses' if you use a local DNS resolver
+#pass out quick on egress inet proto udp from (egress) to ${dns_server} port 53 user _pkgfetch
+#pass out quick on egress inet proto tcp from (egress) to any port 80 user _pkgfetch
+
+## Block all outbound TCP and UDP traffic initiated from this system
+block out quick inet proto { tcp, udp } from any to any user >= 0
+
+## Allow all outbound traffic from this system
+pass out quick on egress inet from (egress) to any
+
+## EXAMPLE RULES
+##
+## Example rules for a stricter firewall ruleset. You need to
+## disable the 'Allow all outbound traffic from this system' rule
+## with a '#'
+
+## Allow outbound SSH traffic
+#pass out quick on egress inet proto tcp from (egress) to any port 22
+
+## Allow outbound DNS traffic from ${internal_network} to ${dns_server}
+## Put this line before 'Block all outbound traffic to RFC1918 local
+## area network addresses' if you use a local DNS resolver
+#pass out quick on egress inet proto udp from (egress) to ${dns_server} port 53
+
+## Allow outbound MAIL traffic
+#pass out quick on egress inet proto tcp from (egress) to any port { 25, 110, 143, 587, 993, 995 }
+
+## Allow outbound HTTP(S) traffic
+#pass out quick on egress inet proto tcp from (egress) to any port { 80, 443 }
+
+## Allow outbound IPSEC VPN traffic
+#pass out quick on egress inet proto udp from (egress) to any port 500
+#pass out quick on egress inet proto { tcp, udp } from (egress) to any port 4500
+
+## Allow outbound Tor controlport traffic
+## Put this line before 'Block all outbound traffic to RFC1918 local
+## area network addresses' if you use a local Tor router
+#pass out quick on egress inet proto tcp from (egress) to ${tor_server} port ${tor_controlport}
+
+## Allow outbound Tor socks traffic
+## Put this line before 'Block all outbound traffic to RFC1918 local
+## area network addresses' if you use a local Tor router
+#pass out quick on egress inet proto tcp from (egress) to ${tor_server} port { ${tor_socksport_default}, ${tor_socksport_mua}, ${tor_socksport_tails}, ${tor_socksport_browser}, ${tor_socksport_onion}, ${tor_socksport_onion_auth} }
+
+## Allow outbound Bitcoin traffic
+#pass out quick on egress inet proto tcp from (egress) to any port { 8332, 8333, 18332, 18333 }
+
+## Allow outbound Monero traffic
+#pass out quick on egress inet proto tcp from (egress) to any port { 18080, 18081, 28080, 28081 }
+
+
+__EOF
+# End of pf firewall configuration
+
+
+#######################
+### Immutable flags ###
+#######################
+
+cat <<__EOF>> /etc/set-immutable-flags.sh
+#!/bin/sh
+
+# Set immutable flags on files and folders
+
+# See /etc/unset-immutable-flags.sh to (temporarily) disable
+# immutable flags.
+
+chflags schg / 2>/dev/null
+
+chflags -R schg /altroot 2>/dev/null
+chflags -R schg /bin 2>/dev/null
+chflags -R schg /etc 2>/dev/null
+chflags -R schg /home 2>/dev/null
+chflags -R schg /mfs 2>/dev/null
+chflags -R schg /mnt 2>/dev/null
+chflags -R schg /root 2>/dev/null
+chflags -R schg /sbin 2>/dev/null
+chflags -R schg /usr 2>/dev/null
+
+chflags schg /.cshrc 2>/dev/null
+chflags schg /.profile 2>/dev/null
+chflags schg /boot 2>/dev/null
+chflags schg /bsd 2>/dev/null
+chflags schg /bsd.mp 2>/dev/null
+chflags schg /bsd.rd 2>/dev/null
+chflags schg /bsd.sp 2>/dev/null
+chflags schg /obsd 2>/dev/null
+
+__EOF
+
+cat <<__EOF>> /etc/unset-immutable-flags.sh
+#!/bin/sh
+
+# Remove immutable flags from files and folders
+
+# How to temporarily remove immutable flags, make changes to the
+# system and set immutable flags back again:
+#
+# kill -15 1
+# mount -uw /
+# /etc/unset-immutable-flags.sh
+# export TERM=vt220
+# <Make modifications to the system>
+# /etc/set-immutable-flags.sh
+# exit
+
+chflags noschg / 2>/dev/null
+
+chflags -R noschg /altroot 2>/dev/null
+chflags -R noschg /bin 2>/dev/null
+chflags -R noschg /etc 2>/dev/null
+chflags -R noschg /home 2>/dev/null
+chflags -R noschg /mfs 2>/dev/null
+chflags -R noschg /mnt 2>/dev/null
+chflags -R noschg /root 2>/dev/null
+chflags -R noschg /sbin 2>/dev/null
+chflags -R noschg /usr 2>/dev/null
+
+chflags noschg /.cshrc 2>/dev/null
+chflags noschg /.profile 2>/dev/null
+chflags noschg /boot 2>/dev/null
+chflags noschg /bsd 2>/dev/null
+chflags noschg /bsd.mp 2>/dev/null
+chflags noschg /bsd.rd 2>/dev/null
+chflags noschg /bsd.sp 2>/dev/null
+chflags noschg /obsd 2>/dev/null
+
+__EOF
+
+chmod 500 /etc/set-immutable-flags.sh
+chmod 500 /etc/unset-immutable-flags.sh
+
+
+###################################
+### CONFIGURE /etc/rc.firsttime ###
+###################################
+
+# rc.firsttime will run once on the first normal boot
+
+cat <<'__EOF'>> /etc/rc.firsttime
+
+# Push custom cryptographic seed 2 into the kernel
+if [[ -f /custom-random.seed2 ]]; then
+  dd if=/custom-random.seed2 of=/dev/random bs=65536 count=1 status=none
+  rm -P /custom-random.seed2
+fi
+
+# Push old seed into the kernel, create a future seed and create a
+# seed file for the boot-loader.
+dd if=/var/db/host.random of=/dev/random bs=65536 count=1 status=none
+chmod 600 /var/db/host.random
+dd if=/dev/random of=/var/db/host.random bs=65536 count=1 status=none
+dd if=/dev/random of=/etc/random.seed bs=512 count=1 status=none
+chmod 600 /etc/random.seed
+
+# Configure random mac address for network interfaces
+for i in /etc/hostname.+([[:alpha:]])+([[:digit:]]); do
+  echo "lladdr random" >> $i
+done
+
+# Import firmware files
+if [[ -d /firmware ]]; then
+  mv /firmware/* /etc/firmware/
+  chown root:bin /etc/firmware/*
+  chmod 0644 /etc/firmware/*
+  rm -r /firmware
+fi
+
+# Install missing firmware
+/usr/sbin/fw_update -v -p /etc/firmware/
+
+##############################
+## FILESYSTEM MODIFICATIONS ##
+##############################
+
+# Backup fstab
+cp -p /etc/fstab /etc/fstab-orig
+
+# Create /mfs directory
+mkdir /mfs/
+
+# Copy /var to /mfs
+cp -rp /var /mfs/
+rm -r /mfs/var/run/*
+rm -r /mfs/var/cache/*
+rm -r /mfs/var/cron/tabs/*.sock
+
+# Create /dev in /mfs
+mkdir /mfs/dev
+cp -p /dev/MAKEDEV /mfs/dev/
+cd /mfs/dev/ && ./MAKEDEV all
+
+# Add /tmp entry to /etc/stab
+echo "" >> /etc/fstab
+echo "# /tmp in RAM with 64MB" >> /etc/fstab
+echo "swap /tmp mfs rw,-s64m,nodev,nosuid,noatime 0 0" >> /etc/fstab
+
+# Add /var entry to /etc/stab
+echo "" >> /etc/fstab
+echo "# /var in RAM with 64MB" >> /etc/fstab
+echo "swap /var mfs rw,-s64m,nodev,nosuid,noatime,-P=/mfs/var/ 0 0" >> /etc/fstab
+
+# Add /mfs/dev entry to /etc/fstab
+echo "" >> /etc/fstab
+echo "# /dev in RAM" >> /etc/fstab
+echo "swap /dev mfs rw,-s4m,nosuid,noexec,noatime,-P=/mfs/dev/,-i128 0 0" >> /etc/fstab
+
+# Set all ffs filesystems to read-only
+sed -i 's/ffs rw/ffs ro/' /etc/fstab
+
+# Remove /etc/rc.firsttime.run
+if [[ -f /etc/rc.firsttime.run ]]; then
+  rm -P /etc/rc.firsttime.run
+fi
+
+# Set files and folders to immutable
+/etc/set-immutable-flags.sh
+
+# Automatic reboot
+reboot
+
+__EOF
+
+# Remove archives
+for i in /*.tgz; do
+  if [[ -f $i ]]; then
+    rm -P $i
+  fi
+done
+
+# Remove install.site
+if [[ -f /install.site ]]; then
+  rm -P /install.site
+fi
+
+# Exit script
+exit 0

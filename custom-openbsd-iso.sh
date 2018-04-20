@@ -231,7 +231,7 @@ else
 fi
 
 # Download index.txt from the packages directory
-if ! wget -O index-packages.txt https://$(random_mirror)/pub/OpenBSD/"${openbsd_release}"/packages/amd64/index.txt; then
+if ! wget -O index-packages.txt https://$(random_mirror)/pub/OpenBSD/"${openbsd_release}"/packages/"${system_architecture}"/index.txt; then
   echo "ERROR: Failed to download index.txt of the packages directory."
   echo "Please diagnose the problem and run the script again."
   exit 1

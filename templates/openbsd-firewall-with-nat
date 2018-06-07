@@ -1,5 +1,8 @@
 #!/bin/ksh
 
+set -u
+set -e
+
 # Variables
 internal_ip="172.16.1.1" # The internal IP of the system
 internal_network="172.16.1.0"
@@ -303,14 +306,6 @@ if [[ -f /custom-random.seed2 ]]; then
   rm -P /custom-random.seed2
 fi
 
-# Push old seed into the kernel, create a future seed and create a
-# seed file for the boot-loader.
-dd if=/var/db/host.random of=/dev/random bs=65536 count=1 status=none
-chmod 600 /var/db/host.random
-dd if=/dev/random of=/var/db/host.random bs=65536 count=1 status=none
-dd if=/dev/random of=/etc/random.seed bs=512 count=1 status=none
-chmod 600 /etc/random.seed
-
 # Configure random mac address for network interfaces
 for i in /etc/hostname.+([[:alpha:]])+([[:digit:]]); do
   echo "lladdr random" >> $i
@@ -328,6 +323,19 @@ fi
 /usr/sbin/fw_update -v -p /etc/firmware/
 
 ##############################
+## SAVE CRYPTOGRAPHIC SEEDS ##
+##############################
+
+# Push old seed into the kernel, create a future seed and create a
+# seed file for the boot-loader.
+dd if=/var/db/host.random of=/dev/random bs=65536 count=1 status=none
+chmod 600 /var/db/host.random
+dd if=/dev/random of=/var/db/host.random bs=65536 count=1 status=none
+dd if=/dev/random of=/etc/random.seed bs=512 count=1 status=none
+chmod 600 /etc/random.seed
+
+
+##############################
 ## FILESYSTEM MODIFICATIONS ##
 ##############################
 
@@ -338,10 +346,10 @@ cp -p /etc/fstab /etc/fstab-orig
 mkdir /mfs/
 
 # Copy /var to /mfs
-cp -rp /var /mfs/
-rm -r /mfs/var/run/*
-rm -r /mfs/var/cache/*
-rm -r /mfs/var/cron/tabs/*.sock
+cp -rp /var /mfs/ || true
+rm -r /mfs/var/run/* || true
+rm -r /mfs/var/cache/* || true
+rm -r /mfs/var/cron/tabs/*.sock || true
 
 # Create /dev in /mfs
 mkdir /mfs/dev
@@ -368,7 +376,7 @@ sed -i 's/ffs rw/ffs ro/' /etc/fstab
 
 # Remove /etc/rc.firsttime.run
 if [[ -f /etc/rc.firsttime.run ]]; then
-  rm -P /etc/rc.firsttime.run
+  rm /etc/rc.firsttime.run
 fi
 
 # Set files and folders to immutable

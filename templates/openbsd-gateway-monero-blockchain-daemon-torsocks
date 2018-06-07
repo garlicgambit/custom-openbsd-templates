@@ -1,0 +1,1060 @@
+#!/bin/ksh
+
+set -u
+set -e
+
+# Variables
+internal_ip="172.16.2.1" # The IP for the Monero service
+internal_server="172.16.2.2" # An optional server in the internal network
+internal_network="172.16.2.0"
+internal_netmask="24" # 24 = 255.255.255.0
+tor_controlport="9052"
+tor_dnsport="5353"
+tor_transport="9040"
+tor_socksport_default="9050"
+tor_socksport_mua="9061"
+tor_socksport_tails="9062"
+tor_socksport_browser="9150"
+tor_socksport_onion="9250"
+tor_socksport_onion_auth="9350"
+tor_username="_tor"
+tor_onion_service_dirs="/hidden_service"
+tor_proxy_ip="172.16.1.1"
+monero_version="v0.12.2.0"
+monero_username="_monerod"
+monero_p2p_ip="127.0.0.1"
+monero_rpc_ip="${internal_ip}"
+monero_zmq_ip="${internal_ip}"
+monero_p2p_port="18080"
+monero_rpc_port="18081"
+monero_zmq_port="18082"
+monero_data_dir=".bitmonero"
+monero_config_file="bitmonero.conf"
+monero_builduser="_monerobuild"
+monero_mining_address="463DQj1ebHSWrsyuFTfHSTDaACx3WZtmMFMwb6QEX7asGyUBaRe2fHbhMchpZnaQ6XKXcHZLq8Vt1BRSLpbqdr283QinCRK" # Garlic Gambit address
+## TODO: Kovri/I2P
+#i2p_socksport_default=""
+#i2p_socksport_monero=""
+#i2p_socksport_browser=""
+#i2p_username=""
+#i2p_service_dirs=""
+
+echo ""
+echo "### CUSTOM INSTALL SCRIPT ###"
+echo ""
+
+# Push custom cryptographic seed 1 into the kernel
+if [[ -f /custom-random.seed1 ]]; then
+  dd if=/custom-random.seed1 of=/dev/random bs=65536 count=1 status=none
+  rm -P /custom-random.seed1
+fi
+
+# Configure securelevel 2 on boot
+echo "# Configure securelevel 2 on system boot" >> /etc/rc.local
+echo "sysctl kern.securelevel=2" >> /etc/rc.local
+
+# Push the old cryptographic seed into the kernel on boot
+echo "" >> /etc/rc.local
+echo "# Push the old seed into the kernel on system boot" >> /etc/rc.local
+echo "if [[ -f /home/_kernelseed/host.random ]]; then" >> /etc/rc.local
+echo "  dd if=/home/_kernelseed/host.random of=/dev/random bs=65536 count=1 status=none" >> /etc/rc.local
+echo "  chmod 0600 /home/_kernelseed/host.random" >> /etc/rc.local
+echo "fi" >> /etc/rc.local
+
+# Create a future cryptographic seed on shutdown
+echo "# Create a future seed" >> /etc/rc.shutdown
+echo "if [[ -d /home/_kernelseed/ ]]; then" >> /etc/rc.shutdown
+echo '  dd if=/dev/random of=/home/_kernelseed/host.random bs=65536 count=1 status=none ||
+  echo "### WARNING: FAILED TO STORE CRYPTO SEED FOR THE KERNEL!!! ###"' >> /etc/rc.shutdown
+echo "  chmod 0600 /home/_kernelseed/host.random" >> /etc/rc.shutdown
+echo "fi" >> /etc/rc.shutdown
+
+# Disable library reordering on boot
+echo "library_aslr=NO" >> /etc/rc.conf.local
+
+# Disable sshd on boot
+echo "sshd_flags=NO" >> /etc/rc.conf.local
+
+# Disable ntpd on boot
+echo "ntpd_flags=NO" >> /etc/rc.conf.local
+
+# Disable ddb.panic to prevent securelevel changes
+echo "# Disable ddb.panic to prevent securelevel changes" >> /etc/sysctl.conf
+echo "ddb.panic=0" >> /etc/sysctl.conf
+
+
+#############
+### USERS ###
+#############
+
+# Add Monero build user
+adduser -quiet -noconfig -shell nologin -class daemon -batch "${monero_builduser}"
+
+# Add Monero daemon user
+adduser -quiet -noconfig -shell nologin -class daemon -batch "${monero_username}"
+
+
+#################################
+### PF FIREWALL CONFIGURATION ###
+#################################
+
+# Backup pf firewall configuration
+cp /etc/pf.conf /etc/pf.conf-orig
+
+# Configure pf firewall
+cat <<__EOF> /etc/pf.conf
+
+############
+## TABLES ##
+############
+
+# RFC1918
+table <private> const { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }
+
+# Other non-routable ip addresses
+table <nonroutable> const { 0.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32 }
+
+#############
+## OPTIONS ##
+#############
+
+## Drop blocked packets
+set block-policy drop
+
+## Allow traffic loopback interface
+set skip on lo
+
+###################
+## GENERAL RULES ##
+###################
+
+## Default deny policy
+block
+
+## Block ipv6 traffic
+block quick inet6
+
+###################
+## ANTI SPOOFING ##
+###################
+
+## Antispoofing for external interface
+antispoof quick for egress
+
+## Block packets with wrong source interface
+block in quick from urpf-failed
+
+## Block packets with no route
+block in quick from no-route
+
+###########################
+## TRAFFIC NORMALIZATION ##
+###########################
+
+## Scrub all incoming packets
+match in all scrub (no-df max-mss 1440)
+
+## Scrub outbound packets
+match out on egress all scrub (no-df random-id reassemble tcp max-mss 1440)
+
+###################
+## INBOUND RULES ##
+###################
+
+## Allow inbound SSH traffic from ${internal_network} to ${internal_ip}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${internal_ip} port 22 user root
+
+## DISABLED: Tor controlport is disabled for security reasons
+##
+## Allow inbound traffic to Tor ControlPort ${tor_controlport}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${internal_ip} port ${tor_controlport} user root
+
+## Allow inbound traffic to Tor SocksPort ${tor_socksport_default}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${internal_ip} port ${tor_socksport_default} user root
+
+## Allow inbound traffic to Tor SocksPort ${tor_socksport_mua}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${internal_ip} port ${tor_socksport_mua} user root
+
+## Allow inbound traffic to Tor SocksPort ${tor_socksport_tails}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${internal_ip} port ${tor_socksport_tails} user root
+
+## Allow inbound traffic to Tor SocksPort ${tor_socksport_browser}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${internal_ip} port ${tor_socksport_browser} user root
+
+## Allow inbound traffic to Tor SocksPort ${tor_socksport_onion}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${internal_ip} port ${tor_socksport_onion} user root
+
+## Allow inbound traffic to Tor SocksPort ${tor_socksport_onion_auth}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${internal_ip} port ${tor_socksport_onion_auth} user root
+
+## Allow inbound traffic to Monero P2P Port ${monero_p2p_port}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${monero_p2p_ip} port ${monero_p2p_port} user ${monero_username}
+
+## Allow inbound traffic to Monero RPC Port ${monero_rpc_port}
+pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${monero_rpc_ip} port ${monero_rpc_port} user ${monero_username}
+
+## Allow inbound traffic to Monero ZMQ Port ${monero_zmq_port}
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to ${monero_zmq_ip} port ${monero_zmq_port} user ${monero_username}
+
+## EXAMPLE RULES FOR TOR .ONION SERVICES
+
+## Allow inbound traffic from ${tor_proxy_ip} to Monero P2P Port ${monero_p2p_port}
+#pass in quick on egress inet proto tcp from ${tor_proxy_ip} to self port ${monero_p2p_port} user ${monero_username}
+
+## Allow inbound traffic from ${tor_proxy_ip} to Monero RPC Port ${monero_rpc_port}
+#pass in quick on egress inet proto tcp from ${tor_proxy_ip} to self port ${monero_rpc_port} user ${monero_username}
+
+## Allow inbound traffic from ${tor_proxy_ip} to Monero ZMQ Port ${monero_zmq_port}
+#pass in quick on egress inet proto tcp from ${tor_proxy_ip} to self port ${monero_zmq_port} user ${monero_username}
+
+##############
+## REDIRECT ##
+##############
+
+## DISABLED: Use torsocks on the remote system to route traffic
+## through this Tor proxy.
+##
+## Redirect DNS traffic from ${internal_network} to the Tor DNSPort
+#pass in quick on ! egress inet proto udp from ${internal_network}/${internal_netmask} to ${internal_ip} port 53 rdr-to ${internal_ip} port ${tor_dnsport}
+
+## DISABLED: Use torsocks on the remote system to route traffic
+## through this Tor proxy.
+##
+## Redirect all TCP traffic from ${internal_network} to the Tor TransPort
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to any rdr-to ${internal_ip} port ${tor_transport}
+
+## EXAMPLE RULES
+##
+## Example rules for a stricter firewall ruleset. You need to
+## disable the 'Redirect all TCP traffic from ${internal_network} to
+## the Tor TransPort' rule with a '#'
+
+## Redirect SSH traffic from ${internal_network} to the Tor TransPort
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to any port 22 rdr-to ${internal_ip} port ${tor_transport}
+
+## Redirect MAIL traffic from ${internal_network} to the Tor TransPort
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to any port { 25, 110, 143, 587, 993, 995 } rdr-to ${internal_ip} port ${tor_transport}
+
+## Redirect HTTP(S) traffic from ${internal_network} to the Tor TransPort
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to any port { 80, 443 } rdr-to ${internal_ip} port ${tor_transport}
+
+## Redirect XMPP and IRC traffic from ${internal_network} to Tor TransPort
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to any port { 5222, 5223, 6667, 6697 } rdr-to ${internal_ip} port ${tor_transport}
+
+## Redirect Bitcoin traffic from ${internal_network} to the Tor TransPort
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to any port { 8332, 8333, 18332, 18333 } rdr-to ${internal_ip} port ${tor_transport}
+
+## Redirect Monero traffic from ${internal_network} to the Tor TransPort
+#pass in quick on ! egress inet proto tcp from ${internal_network}/${internal_netmask} to any port { 18080, 18081, 28080, 28081 } rdr-to ${internal_ip} port ${tor_transport}
+
+####################
+## OUTBOUND RULES ##
+####################
+
+## Allow outbound traffic from this system to DHCP
+#pass out quick on egress proto udp from (egress) port 68 to egress:network port 67
+
+## Allow outbound traffic from Monero daemon to the Tor
+## SocksPort ${tor_socksport_default} on ${tor_proxy_ip}
+pass out quick on egress inet proto tcp from (egress) to ${tor_proxy_ip} port ${tor_socksport_default} user ${monero_username}
+
+## Allow outbound traffic from Monero daemon
+#pass out quick on egress inet proto tcp from (egress) to any user ${monero_username}
+
+## Block all outbound traffic to RFC1918 local area network addresses
+block out quick on egress inet from any to <private>
+
+## Block all outbound traffic to other non-routable addresses
+block out quick on egress inet from any to <nonroutable>
+
+## Allow outbound traffic from Tor service
+#pass out quick on egress inet proto tcp from (egress) to any user ${tor_username}
+
+##########################
+## ONION SERVICES RULES ##
+##########################
+
+## Allow outbound traffic from Tor service to the SSH port on
+## onion service ${internal_server}
+#pass out quick on ! egress inet proto tcp from ${internal_ip} to ${internal_server} port 22 user ${tor_username}
+
+## Allow outbound traffic from Tor service to the HTTP port on
+## onion service ${internal_server}
+#pass out quick on ! egress inet proto tcp from ${internal_ip} to ${internal_server} port 80 user ${tor_username}
+
+## Allow outbound traffic from Tor service to the HTTPS port on
+## onion service ${internal_server}
+#pass out quick on ! egress inet proto tcp from ${internal_ip} to ${internal_server} port 443 user ${tor_username}
+
+## Allow outbound traffic from Tor service to the Bitcoin RPC port on
+## onion service ${internal_server}
+#pass out quick on ! egress inet proto tcp from ${internal_ip} to ${internal_server} port 8332 user ${tor_username}
+
+## Allow outbound traffic from Tor service to the Bitcoin P2P port on
+## onion service ${internal_server}
+#pass out quick on ! egress inet proto tcp from ${internal_ip} to ${internal_server} port 8333 user ${tor_username}
+
+## Allow outbound traffic from Tor service to the Monero P2P port on
+## onion service ${internal_server}
+#pass out quick on ! egress inet proto tcp from ${internal_ip} to ${internal_server} port 18080 user ${tor_username}
+
+## Allow outbound traffic from Tor service to the Monero RPC port on
+## onion service ${internal_server}
+#pass out quick on ! egress inet proto tcp from ${internal_ip} to ${internal_server} port 18081 user ${tor_username}
+
+__EOF
+# End of pf firewall configuration
+
+
+##########################
+#### TOR CONFIGURATION ###
+##########################
+#
+## Install packages during install
+#pkg_add tor
+#
+## Import manually created Tor onion services
+#for i in "${tor_onion_service_dirs}"*; do
+#  if [[ -d $i ]]; then
+#    mv $i /var/tor/
+#    chown -R "${tor_username}":"${tor_username}" /var/tor/$i
+#    chmod 0700 /var/tor/$i
+#    chmod 0600 /var/tor/$i/*
+#    echo "$i is deployed in /var/tor/"
+#  fi
+#done
+#
+## Backup Tor configuration
+#cp /etc/tor/torrc /etc/tor/torrc-orig
+#
+## Configure Tor
+#cat <<__EOF>> /etc/tor/torrc
+#
+### Do not remove or edit DisableNetwork. This is part of the
+### installation process.
+#DisableNetwork 1
+#
+#################################################
+#### Customizations based on torrc from Tails ###
+#################################################
+#
+### Disable all SocksPort connections
+##SocksPort 0
+#
+### Default SocksPort
+#SocksPort ${internal_ip}:${tor_socksport_default} IsolateDestAddr IsolateDestPort
+### SocksPort for the MUA
+#SocksPort ${internal_ip}:${tor_socksport_mua} IsolateDestAddr
+### SocksPort for Tails-specific applications
+#SocksPort ${internal_ip}:${tor_socksport_tails} IsolateDestAddr IsolateDestPort
+### SocksPort for the default web browser
+#SocksPort ${internal_ip}:${tor_socksport_browser} IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth
+#
+### Onion traffic only SocksPorts
+###
+### SocksPort for .onion only applications
+#SocksPort ${internal_ip}:${tor_socksport_onion} OnionTrafficOnly IsolateDestAddr IsolateDestPort
+### SocksPort for .onion only applications with socks authentication
+#SocksPort ${internal_ip}:${tor_socksport_onion_auth} OnionTrafficOnly IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth
+#
+### FIXME: ControlPort is disabled for security reasons
+###
+### The port on which Tor will listen for local connections from Tor
+### controller applications, as documented in control-spec.txt.
+##ControlPort 9052
+##ControlListenAddress ${internal_ip}
+#
+### DISABLED: Use torsocks on the remote system to route traffic
+### through this Tor proxy.
+###
+### Torified DNS
+##DNSPort ${internal_ip}:${tor_dnsport}
+#AutomapHostsOnResolve 1
+#AutomapHostsSuffixes .exit,.onion
+#
+### DISABLED: Use torsocks on the remote system to route traffic
+### through this Tor proxy.
+###
+### Transparent proxy
+##TransPort ${internal_ip}:${tor_transport} IsolateDestAddr # Plus IsolateDestAddr
+### Disabled: deprecated option
+##TransListenAddress ${internal_ip}
+#
+### Misc
+#AvoidDiskWrites 1
+#
+### Disabled: deprecated option
+### We don't care if applications do their own DNS lookups since our Tor
+### enforcement will handle it safely.
+##WarnUnsafeSocks 0
+#
+### Disable default warnings on StartTLS for email. Let's not train our
+### users to click through security warnings.
+#WarnPlaintextPorts 23,109
+#
+#############################
+#### Local onion services ###
+#############################
+#
+### Example onion service configurations
+###
+### Uncomment HiddenServiceDir and HiddenServicePort to enable
+### a Tor onion service. Make sure you use the right port and
+### IP address combination. Check the hostname file to obtain the
+### .onion hostname. Example .onion hostname: 2tbi9klopsalxaqq.onion
+###
+### You can only configure one onion service per HiddenServiceDir.
+### If you want to run multiple onion services you need to create
+### multiple HiddenServiceDirs. It is possible to forward multiple
+### ports to the same .onion service.
+###
+### Example with two .onion services:
+###
+### HiddenServiceDir /var/tor/hidden_service/
+### HiddenServicePort 22 127.0.0.1:22   # Single port
+###
+### HiddenServiceDir /var/tor/hidden_service_www/
+### HiddenServicePort 80 127.0.0.1:80   # Multiple ports
+### HiddenServicePort 443 127.0.0.1:443 # Multiple ports
+### HiddenServicePort XYZ 127.0.0.1:XYZ # Multiple ports
+###
+### Optional: Uncomment HiddenServiceAuthorizeClient to enable client
+### authorization for an onion service.
+### The authorization key and .onion address can be found in the
+### hostname file. Clients need to add the authorization key to their
+### local Tor torrc configuration with the 'HidServAuth' option.
+###
+### Example HidServAuth configuration for a Tor client:
+### HidServAuth 2tbi9klopsalxaqq.onion cB1h4uWhSRgYRIln8EAhgb
+###
+### Optional: Uncomment HiddenServiceVersion 3 to configure next
+### generation onion services which have better crypto and longer
+### .onion hostnames. Requires Tor version 0.3.2.x or later.
+### HiddenServiceVersion 3 is currently not compatible with
+### HiddenServiceAuthorizeClient.
+#
+### Onion service for the SSH server on this system
+##HiddenServiceDir /var/tor/hidden_service/
+##HiddenServicePort 22 127.0.0.1:22
+### Optional client authorization for three clients
+##HiddenServiceAuthorizeClient stealth client1,client2,client3
+### Optional version 3 next generation .onion service
+##HiddenServiceVersion 3
+#
+### Onion service for the webserver on this system
+##HiddenServiceDir /var/tor/hidden_service_www/
+##HiddenServicePort 80 127.0.0.1:80
+### Optional client authorization for three clients
+##HiddenServiceAuthorizeClient stealth client1,client2,client3
+### Optional version 3 next generation .onion service
+##HiddenServiceVersion 3
+#
+### Onion service for the SSH server on ${internal_server}
+##HiddenServiceDir /var/tor/hidden_service_ssh_${internal_server}/
+##HiddenServicePort 22 ${internal_server}:22
+### Optional client authorization for three clients
+##HiddenServiceAuthorizeClient stealth client1,client2,client3
+### Optional version 3 next generation .onion service
+##HiddenServiceVersion 3
+#
+### Onion service for the webserver on ${internal_server}
+##HiddenServiceDir /var/tor/hidden_service_www_${internal_server}/
+##HiddenServicePort 80 ${internal_server}:80
+### Optional client authorization for three clients
+##HiddenServiceAuthorizeClient stealth client1,client2,client3
+### Optional version 3 next generation .onion service
+##HiddenServiceVersion 3
+#
+### Onion service for the Bitcoin RPC wallet service on ${internal_server}
+##HiddenServiceDir /var/tor/hidden_service_btc_rpc_${internal_server}/
+##HiddenServicePort 8332 ${internal_server}:8332
+### Optional client authorization for three clients
+##HiddenServiceAuthorizeClient stealth client1,client2,client3
+### Optional version 3 next generation .onion service
+##HiddenServiceVersion 3
+#
+### Onion service for the Bitcoin P2P blockchain sync on ${internal_server}
+##HiddenServiceDir /var/tor/hidden_service_btc_p2p_${internal_server}/
+##HiddenServicePort 8333 ${internal_server}:8333
+### Optional client authorization for three clients
+##HiddenServiceAuthorizeClient stealth client1,client2,client3
+### Optional version 3 next generation .onion service
+##HiddenServiceVersion 3
+#
+### Onion service for the Monero P2P blockchain sync on ${internal_server}
+##HiddenServiceDir /var/tor/hidden_service_xmr_p2p_${internal_server}/
+##HiddenServicePort 18080 ${internal_server}:18080
+### Optional client authorization for three clients
+##HiddenServiceAuthorizeClient stealth client1,client2,client3
+### Optional version 3 next generation .onion service
+##HiddenServiceVersion 3
+#
+### Onion service for the Monero RPC wallet service on ${internal_server}
+##HiddenServiceDir /var/tor/hidden_service_xmr_rpc_${internal_server}/
+##HiddenServicePort 18081 ${internal_server}:18081
+### Optional client authorization for three clients
+##HiddenServiceAuthorizeClient stealth client1,client2,client3
+### Optional version 3 next generation .onion service
+##HiddenServiceVersion 3
+#
+##############################
+#### Remote onion services ###
+##############################
+#
+### In this section you can configure the authorization data for
+### stealth onion services that are hosted on a remote location.
+### Local Tor socks clients will be able to use these onion services.
+### The authorization key and .onion address can be found in the
+### hostname file on the remote .onion service.
+###
+### Example:
+### HidServAuth hostname.onion authorization-key
+### HidServAuth 2tbi9klopsalxaqq.onion cB1h4uWhSRgYRIln8EAhgb
+#
+### Remote onion service 1
+### Comment: Offsite backup system
+##HidServAuth hostname.onion authorization-key
+#
+### Remote onion service 2
+### Comment: Remote Monero system
+##HidServAuth hostname.onion authorization-key
+#
+### Remote onion service 3
+### Comment: Remote security monitoring system
+##HidServAuth hostname.onion authorization-key
+#
+#__EOF
+## End of torrc configuration
+
+
+#######################
+### Immutable flags ###
+#######################
+
+cat <<__EOF>> /etc/set-immutable-flags.sh
+#!/bin/sh
+
+# Set immutable flags on files and folders
+
+# See /etc/unset-immutable-flags.sh to (temporarily) disable
+# immutable flags.
+
+chflags schg / 2>/dev/null
+
+chflags -R schg /altroot 2>/dev/null
+chflags -R schg /bin 2>/dev/null
+chflags -R schg /etc 2>/dev/null
+#chflags -R schg /home 2>/dev/null
+chflags -R schg /mfs 2>/dev/null
+chflags -R schg /mnt 2>/dev/null
+chflags -R schg /root 2>/dev/null
+chflags -R schg /sbin 2>/dev/null
+chflags -R schg /usr 2>/dev/null
+
+chflags schg /.cshrc 2>/dev/null
+chflags schg /.profile 2>/dev/null
+chflags schg /boot 2>/dev/null
+chflags schg /bsd 2>/dev/null
+chflags schg /bsd.mp 2>/dev/null
+chflags schg /bsd.rd 2>/dev/null
+chflags schg /bsd.sp 2>/dev/null
+chflags schg /obsd 2>/dev/null
+
+# Monero
+chflags schg /home 2>/dev/null
+chflags -R schg /home/"${monero_builduser}" 2>/dev/null
+#chflags schg /home/"${monero_username}" 2>/dev/null
+chflags schg /home/"${monero_username}"/monerod.sh 2>/dev/null
+#chflags schg /home/"${monero_username}"/"${monero_data_dir}" 2>/dev/null
+#chflags schg /home/"${monero_username}"/"${monero_data_dir}"/"${monero_config_file}" 2>/dev/null
+#chflags schg /home/"${monero_username}"/"${monero_data_dir}"/lmdb 2>/dev/null
+
+__EOF
+
+cat <<__EOF>> /etc/unset-immutable-flags.sh
+#!/bin/sh
+
+# Remove immutable flags from files and folders
+
+# How to temporarily remove immutable flags, make changes to the
+# system and set immutable flags back again:
+#
+# kill -15 1
+# mount -uw /
+# /etc/unset-immutable-flags.sh
+# export TERM=vt220
+# <Make modifications to the system>
+# /etc/set-immutable-flags.sh
+# exit
+
+chflags noschg / 2>/dev/null
+
+chflags -R noschg /altroot 2>/dev/null
+chflags -R noschg /bin 2>/dev/null
+chflags -R noschg /etc 2>/dev/null
+chflags -R noschg /home 2>/dev/null
+chflags -R noschg /mfs 2>/dev/null
+chflags -R noschg /mnt 2>/dev/null
+chflags -R noschg /root 2>/dev/null
+chflags -R noschg /sbin 2>/dev/null
+chflags -R noschg /usr 2>/dev/null
+
+chflags noschg /.cshrc 2>/dev/null
+chflags noschg /.profile 2>/dev/null
+chflags noschg /boot 2>/dev/null
+chflags noschg /bsd 2>/dev/null
+chflags noschg /bsd.mp 2>/dev/null
+chflags noschg /bsd.rd 2>/dev/null
+chflags noschg /bsd.sp 2>/dev/null
+chflags noschg /obsd 2>/dev/null
+
+__EOF
+
+chmod 500 /etc/set-immutable-flags.sh
+chmod 500 /etc/unset-immutable-flags.sh
+
+######################
+## CONFIGURE MONERO ##
+######################
+
+# Compile and configure monero
+cat <<__EOF>> /monero_config.sh
+#!/bin/sh
+
+set -u
+set -e
+
+# Add /usr/local/bin to PATH for cmake and git
+export PATH=\$PATH:/usr/local/bin
+
+# Install packages
+pkg_add /cmake /miniupnpc /zeromq /libiconv /git /torsocks
+
+# Set stricter permissions on home directory
+chmod 0700 /home/"${monero_builduser}"
+
+# Configure doas
+echo "permit nopass root as ${monero_builduser}" >> /etc/doas.conf
+
+# Create boost directory
+boost_version="1_64_0"
+doas -u "${monero_builduser}" mkdir /home/"${monero_builduser}"/boost
+
+# Move boost archive
+mv /boost_"\${boost_version}".tar.bz2 /home/"${monero_builduser}"/boost/
+
+# Extract boost archive
+doas -u "${monero_builduser}" tar xfj /home/"${monero_builduser}"/boost/boost_"\${boost_version}".tar.bz2 -C /home/"${monero_builduser}"/boost/
+
+# Move boost patches
+mv /boost_test_impl_execution_monitor_ipp.patch /home/"${monero_builduser}"/boost/boost_test_impl_execution_monitor_ipp.patch
+mv /boost_config_platform_bsd_hpp.patch /home/"${monero_builduser}"/boost/boost_config_platform_bsd_hpp.patch
+
+# Change directory to boost directory
+cd /home/"${monero_builduser}"/boost/boost_"\${boost_version}"
+
+# Patch boost
+doas -u "${monero_builduser}" patch -p0 < ../boost_test_impl_execution_monitor_ipp.patch
+doas -u "${monero_builduser}" patch -p0 < ../boost_config_platform_bsd_hpp.patch
+
+# Configure user-config.jam
+echo 'using clang : : c++ : <cxxflags>"-fvisibility=hidden -fPIC" <linkflags>"" <archiver>"ar" <striper>"strip"  <ranlib>"ranlib" <rc>"" : ;' > user-config.jam
+
+# Run bootstrap.sh
+doas -u "${monero_builduser}" ./bootstrap.sh --without-icu --with-libraries=chrono,filesystem,program_options,system,thread,test,date_time,regex,serialization,locale --with-toolset=clang
+
+# Run b2
+doas -u "${monero_builduser}" ./b2 toolset=clang cxxflags="-stdlib=libc++" linkflags="-stdlib=libc++" -sICONV_PATH=/usr/local
+
+# Install boost
+./b2 -d0 runtime-link=shared threadapi=pthread threading=multi link=static variant=release --layout=tagged --build-type=complete --user-config=user-config.jam -sNO_BZIP2=1 -sICONV_PATH=/usr/local --prefix=/usr/local install
+
+# Create cppzmq directory
+cppzmq_version="4.2.3"
+doas -u "${monero_builduser}" mkdir /home/"${monero_builduser}"/cppzmq
+
+# Move cppzmq archive
+mv /cppzmq-"\${cppzmq_version}".tar.gz /home/"${monero_builduser}"/cppzmq/
+
+# Extract cppzmq archive
+doas -u "${monero_builduser}" tar xfz /home/"${monero_builduser}"/cppzmq/cppzmq-"\${cppzmq_version}".tar.gz -C /home/"${monero_builduser}"/cppzmq/
+
+# Change directory to cppzmq directory
+cd /home/"${monero_builduser}"/cppzmq/cppzmq-"\${cppzmq_version}"
+
+# Create build directory
+doas -u "${monero_builduser}" mkdir build
+
+# Change directory to build directory
+cd build
+
+# Run cmake
+doas -u "${monero_builduser}" cmake ..
+
+# Install cppzmq
+make install
+
+# Move monero source code directory
+mv /monero /home/"${monero_builduser}"/
+
+# Set permissions on monero directory
+chmod 0700 /home/"${monero_builduser}"/monero/
+chown -R "${monero_builduser}":"${monero_builduser}" /home/"${monero_builduser}"/monero/
+
+# Change directory to monero directory
+cd /home/"${monero_builduser}"/monero/
+
+# Checkout the latest stable monero release
+doas -u "${monero_builduser}" git checkout "${monero_version}"
+
+# Compile monero
+doas -u "${monero_builduser}" env DEVELOPER_LOCAL_TOOLS=1 BOOST_ROOT=/usr/local && make release-static
+
+# Set stricter permissions on home directory
+chmod 0700 /home/"${monero_username}"
+
+# Copy monero binaries to /usr/local/bin/
+cp /home/"${monero_builduser}"/monero/build/release/bin/* /usr/local/bin/
+
+# Set permissions monero binaries
+chmod 0555 /usr/local/bin/monero*
+chown root:bin /usr/local/bin/monero*
+
+# Create monero data directory
+mkdir /home/"${monero_username}"/"${monero_data_dir}"
+
+# Deploy monero configuration
+mv /"${monero_config_file}" /home/"${monero_username}"/"${monero_data_dir}"
+
+# Set permissions on monero data directory
+chmod 0700 /home/"${monero_username}"/"${monero_data_dir}"
+chown -R "${monero_username}":"${monero_username}" /home/"${monero_username}"/"${monero_data_dir}"
+chmod 0600 /home/"${monero_username}"/"${monero_data_dir}"/"${monero_config_file}"
+
+# Start monerod daemon on boot
+mv /monerod.sh /home/"${monero_username}"/
+echo "" >> /etc/rc.local
+echo "# Start monerod daemon on system boot" >> /etc/rc.local
+echo "/home/${monero_username}/monerod.sh" >> /etc/rc.local
+
+__EOF
+
+chmod 0500 /monero_config.sh
+
+#################################
+### Monero configuration file ###
+#################################
+
+# Configure monero configuration file
+cat <<__EOF> /"${monero_config_file}"
+restricted-rpc=1
+hide-my-port=1
+no-igd=1
+confirm-external-bind=1
+rpc-bind-ip=${monero_rpc_ip}
+p2p-bind-ip=${monero_p2p_ip}
+zmq-rpc-bind-ip=${monero_zmq_ip}
+rpc-bind-port=${monero_rpc_port}
+p2p-bind-port=${monero_p2p_port}
+zmq-rpc-bind-port=${monero_zmq_port}
+data-dir=/home/${monero_username}/${monero_data_dir}
+#log-file=/home/${monero_username}/${monero_data_dir}/bitmonero.log
+#log-file=/dev/null		# Disable logging
+#log-level=0
+#max-log-file-size=104850000	# 100MB
+#max-concurrency=0
+#enforce-dns-checkpointing=1
+#prep-blocks-threads=4
+#fast-block-sync=1
+#show-time-stats=0
+#block-sync-size=0
+#check-updates=notify
+#max-txpool-size=648000000
+#start-mining=${monero_mining_address}
+#mining-threads=
+#bg-mining-enable=
+#bg-mining-ignore-battery=
+#bg-mining-min-idle-interval=
+#bg-mining-idle-threshold=
+#bg-mining-miner-target=
+#db-type=lmdb
+#db-sync-mode=fast:async:1000
+#db-salvage=
+#p2p-external-port=
+#allow-local-ip=
+#add-peer=
+#add-priority-node=
+#add-exclusive-node=
+#seed-node=
+#out-peers=
+#in-peers=
+#tos-flag=
+#limit-rate-up=
+#limit-rate-down=
+#limit-rate=
+#save-graph=
+#rpc-restricted-bind-port=
+#bootstrap-daemon-address=	# Add .onion address Monero daemon of a friend
+#bootstrap-daemon-login=
+#rpc-login=
+#rpc-access-control-origins=
+
+__EOF
+
+#############################
+### Monero startup script ###
+#############################
+
+# Configure monerod startup script
+cat <<__EOF> /monerod.sh
+#/bin/sh
+
+set -u
+set -e
+
+daemon="/usr/local/bin/monerod"
+daemon_flags="--detach --config-file /home/${monero_username}/${monero_data_dir}/${monero_config_file}"
+torsocks_daemon="/usr/local/bin/torsocks"
+torsocks_daemon_flags="--address ${tor_proxy_ip} --port ${tor_socksport_default}"
+
+# Run as root
+if [ ! \$(id -u) = '0' ]; then
+  echo "Run this script as root."
+  exit 1
+fi
+
+# Check if monerod is running
+if pgrep -q -xf "\${daemon} \${daemon_flags}"; then
+  echo "\${daemon} is already running."
+  exit 0
+else
+  echo "Starting \${daemon}"
+fi
+
+# Remove p2pstate.bin
+if [[ -f /home/"${monero_username}"/"${monero_data_dir}"/p2pstate.bin ]]; then
+  rm -P /home/"${monero_username}"/"${monero_data_dir}"/p2pstate.bin
+fi
+
+# Start monerod daemon
+#su -l -c daemon -s /bin/sh "${monero_username}" -c "\${daemon} \${daemon_flags}"
+
+# Start monerod daemon with torsocks
+su -l -c daemon -s /bin/sh "${monero_username}" -c "TORSOCKS_ALLOW_INBOUND=1 DNS_PUBLIC=tcp \${torsocks_daemon} \${torsocks_daemon_flags} \${daemon} \${daemon_flags}"
+
+__EOF
+
+chmod 0555 /monerod.sh
+
+#######################
+### Install editors ###
+#######################
+
+# Install editors
+cat <<__EOF> /editors.sh
+#!/bin/ksh
+
+# Install nano
+if [ -f /nano-[[:digit:]].[[:digit:]].+([[:alnum:]]).tgz ]; then
+  pkg_add /nano
+fi
+
+# Install vim
+if [ -f /vim-[[:digit:]].[[:digit:]].+([[:alnum:]])-no_x11.tgz ]; then
+  pkg_add /vim
+fi
+
+__EOF
+
+chmod 0500 /editors.sh
+
+##########################
+### Install misc tools ###
+##########################
+
+# Install editors
+cat <<__EOF> /misc_tools.sh
+#!/bin/ksh
+
+# Install screen
+if [ -f /screen-[[:digit:]].[[:digit:]].+([[:alnum:]]).tgz ]; then
+  pkg_add /screen
+fi
+
+__EOF
+
+chmod 0500 /misc_tools.sh
+
+###################################
+### CONFIGURE /etc/rc.firsttime ###
+###################################
+
+# rc.firsttime will run once on the first normal boot
+
+cat <<'__EOF'>> /etc/rc.firsttime
+
+# Push custom cryptographic seed 2 into the kernel
+if [[ -f /custom-random.seed2 ]]; then
+  dd if=/custom-random.seed2 of=/dev/random bs=65536 count=1 status=none
+  rm -P /custom-random.seed2
+fi
+
+# Start Tor without network access and let it generate onion services
+#grep -q 'DisableNetwork 1' /etc/tor/torrc && /etc/rc.d/tor start
+
+# Give Tor some time to generate the .onion services
+#sleep 10
+
+# Stop Tor
+#/etc/rc.d/tor stop
+
+# Cleanup Tor files
+#for i in lock state; do
+#  if [[ -f /var/tor/$i ]]; then
+#    rm -P /var/tor/$i
+#  fi
+#done
+
+# Allow Tor to the network
+#sed -i 's/DisableNetwork 1/DisableNetwork 0/' /etc/tor/torrc
+
+# Enable Tor at boot
+#echo "pkg_scripts=tor" >> /etc/rc.conf.local
+
+# Configure random mac address for network interfaces
+for i in /etc/hostname.+([[:alpha:]])+([[:digit:]]); do
+  echo "lladdr random" >> $i
+done
+
+# Import firmware files
+if [[ -d /firmware ]]; then
+  mv /firmware/* /etc/firmware/
+  chown root:bin /etc/firmware/*
+  chmod 0644 /etc/firmware/*
+  rm -r /firmware
+fi
+
+# Install missing firmware
+/usr/sbin/fw_update -v -p /etc/firmware/
+
+#############
+## EDITORS ##
+#############
+
+# Install editors
+if [[ -x /editors.sh ]]; then
+  /editors.sh &&
+  rm -P /editors.sh
+fi
+
+################
+## MISC TOOLS ##
+################
+
+# Install misc tools
+if [[ -x /misc_tools.sh ]]; then
+  /misc_tools.sh &&
+  rm -P /misc_tools.sh
+fi
+
+######################
+## CONFIGURE MONERO ##
+######################
+
+# Compile and configure monero
+if [[ -x /monero_config.sh ]]; then
+  /monero_config.sh &&
+  rm -P /monero_config.sh
+fi
+
+#############
+## CLEANUP ##
+#############
+
+# Remove archives
+for i in /*.tgz; do
+  if [[ -f $i ]]; then
+    rm -P $i
+  fi
+done
+
+##############################
+## SAVE CRYPTOGRAPHIC SEEDS ##
+##############################
+
+# Push old seed into the kernel, create a future seed and create a
+# seed file for the boot-loader.
+dd if=/var/db/host.random of=/dev/random bs=65536 count=1 status=none
+chmod 600 /var/db/host.random
+dd if=/dev/random of=/var/db/host.random bs=65536 count=1 status=none
+dd if=/dev/random of=/etc/random.seed bs=512 count=1 status=none
+chmod 600 /etc/random.seed
+
+# Create a location to store the cryptographic seed for the kernel
+mkdir /home/_kernelseed/
+chmod 0700 /home/_kernelseed/
+
+
+##############################
+## FILESYSTEM MODIFICATIONS ##
+##############################
+
+# Backup fstab
+cp -p /etc/fstab /etc/fstab-orig
+
+# Create /mfs directory
+mkdir /mfs/
+
+# Copy /var to /mfs
+cp -rp /var /mfs/ || true
+rm -r /mfs/var/run/* || true
+rm -r /mfs/var/cache/* || true
+rm -r /mfs/var/cron/tabs/*.sock || true
+
+# Create /dev in /mfs
+mkdir /mfs/dev
+cp -p /dev/MAKEDEV /mfs/dev/
+cd /mfs/dev/ && ./MAKEDEV all
+
+# Add /tmp entry to /etc/stab
+echo "" >> /etc/fstab
+echo "# /tmp in RAM with 64MB" >> /etc/fstab
+echo "swap /tmp mfs rw,-s64m,nodev,nosuid,noatime 0 0" >> /etc/fstab
+
+# Add /var entry to /etc/stab
+echo "" >> /etc/fstab
+echo "# /var in RAM with 64MB" >> /etc/fstab
+echo "swap /var mfs rw,-s64m,nodev,nosuid,noatime,-P=/mfs/var/ 0 0" >> /etc/fstab
+
+# Add /mfs/dev entry to /etc/fstab
+echo "" >> /etc/fstab
+echo "# /dev in RAM" >> /etc/fstab
+echo "swap /dev mfs rw,-s4m,nosuid,noexec,noatime,-P=/mfs/dev/,-i128 0 0" >> /etc/fstab
+
+# Set all ffs filesystems to read-only
+sed -i 's/ffs rw/ffs ro/' /etc/fstab
+
+# Set /home to read-write and noatime for monero storage
+sed -i 's# /home ffs ro# /home ffs rw,noatime,#' /etc/fstab
+
+# Remove /etc/rc.firsttime.run
+if [[ -f /etc/rc.firsttime.run ]]; then
+  rm /etc/rc.firsttime.run
+fi
+
+# Set files and folders to immutable
+/etc/set-immutable-flags.sh
+
+# Automatic reboot
+reboot
+
+__EOF
+
+
+# Remove install.site
+if [[ -f /install.site ]]; then
+  rm -P /install.site
+fi
+
+# Exit script
+exit 0
